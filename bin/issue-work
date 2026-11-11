@@ -2,7 +2,7 @@
 // issue-work — GitHub issue triage + automation for agents. TOON output, confidence-gated.
 import { list, kv, help, fail, usageError, parseFlags, ghJson, ghMutate, truncate, fmt } from './common.mjs';
 
-const VERSION = '0.1.2';
+const VERSION = '0.1.3';
 
 import { run } from './common.mjs';
 
