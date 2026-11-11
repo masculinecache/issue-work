@@ -1,5 +1,5 @@
 {
-  "name": "issue-work",
+  "name": "@masculinecache/issue-work",
   "version": "0.1.0",
   "description": "AXI-compliant GitHub issue triage + automation CLI — TOON output, confidence-gated implementation",
   "type": "module",
@@ -9,5 +9,5 @@
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/masculinecache/issue-work.git" },
   "keywords": ["github", "issues", "agents", "cli", "toon", "axi", "triage"],
-  "publishConfig": { "access": "public", "provenance": true }
+  "publishConfig": { "access": "public" }
 }
