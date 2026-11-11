@@ -1,0 +1,343 @@
+#!/usr/bin/env node
+// issue-work — GitHub issue triage + automation for agents. TOON output, confidence-gated.
+import { list, kv, help, fail, usageError, parseFlags, ghJson, ghMutate, truncate, fmt } from './common.mjs';
+
+const VERSION = '0.1.0';
+
+import { run } from './common.mjs';
+
+function resolveRepo(flags) {
+  if (flags.repo) return flags.repo;
+  const r = run('git', ['remote', 'get-url', 'origin']);
+  if (r.code === 0) {
+    const url = r.stdout.trim();
+    const m = url.match(/[:/]([^/:]+\/[^/.]+)(?:\.git)?$/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+const TOP_HELP = `usage: issue-work [command] [args] [flags]
+commands[4]:
+  (none)=triage+implement, triage <number>, list, comment <number>
+flags[4]:
+  -R/--repo <OWNER/NAME>, --dry-run, --confidence-threshold <N> (default 95), --help, -v/--version
+examples:
+  issue-work 42
+  issue-work triage 42 --repo owner/name --dry-run
+  issue-work list --repo owner/name --label bug
+  issue-work comment 42 --body "triaged: confidence 92, scope M"`;
+
+const COMMAND_HELP = {
+  triage: `usage: issue-work triage <number> [flags]
+Triage a single issue: classify, estimate confidence, suggest labels.
+Does not implement — always outputs triage only.
+flags: -R/--repo, --dry-run, --help`,
+  list: `usage: issue-work list [flags]
+List open issues for a repo.
+flags: -R/--repo, --label <name>, --assignee <login>, --state <open|closed|all>, --limit <n> (default 30), --untriaged, --help`,
+  comment: `usage: issue-work comment <number> [flags]
+Post a structured comment on an issue.
+flags: -R/--repo, --body <text> (required), --help`,
+};
+
+function classifyIssue(issue) {
+  const title = (issue.title || '').toLowerCase();
+  const body = (issue.body || '').toLowerCase();
+  const labels = (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name || '')).join(' ');
+
+  const titleMatch = (() => {
+    if (/\b(bug|fix|broken|error|crash|fail|regression|wrong)\b/.test(title)) return 'bug';
+    if (/\b(feat|feature|add|new|support|implement|create)\b/.test(title)) return 'feat';
+    if (/\b(chore|refactor|clean|update|maintain|upgrade|bump|deps?)\b/.test(title)) return 'chore';
+    if (/\b(doc|docs|readme|comment|explain|guide)\b/.test(title)) return 'docs';
+    if (/\b(questi|how\s+to|help|confused|unclear)\b/.test(title)) return 'question';
+    return null;
+  })();
+  if (titleMatch) return titleMatch;
+
+  const text = `${title} ${body} ${labels}`;
+  if (/\b(bug|broken|error|crash|regression|wrong)\b/.test(text)) return 'bug';
+  if (/\b(feat|feature|add|new|support|implement|create)\b/.test(text)) return 'feat';
+  if (/\b(chore|refactor|clean|maintain|upgrade|bump|deps?)\b/.test(text)) return 'chore';
+  if (/\b(doc|docs|readme|explain|guide)\b/.test(text)) return 'docs';
+  if (/\b(questi|how\s+to|help|confused|unclear)\b/.test(text)) return 'question';
+  return 'task';
+}
+
+function estimateConfidence(issue) {
+  const body = issue.body || '';
+  const title = issue.title || '';
+  let score = 50;
+
+  if (/steps?\s+to\s+repro|reproduc|how\s+to\s+repro/i.test(body)) score += 20;
+  if (/expected\s+behavior|actual\s+behavior/i.test(body)) score += 10;
+  if (/acceptance\s+criteria|definition\s+of\s+done/i.test(body)) score += 15;
+  if (/single\s+file|one\s+file|only\s+in\s+\S+\.\S+/i.test(body)) score += 15;
+  if (/\b(test|spec|should|expect)\b/i.test(body)) score += 10;
+  if (/breaking|migration|refactor\s+multiple|across\s+\d+\s+file/i.test(body)) score -= 20;
+  if (/security|auth|secret|token|credential|password|encrypt/i.test(body)) score -= 25;
+  if (/\b(unknown|unclear|maybe|might|perhaps|tbd|todo)\b/i.test(body)) score -= 15;
+  if (/\b(multiple|several|many|various)\s+(file|module|component|service)/i.test(body)) score -= 20;
+  if (/external\s+api|third.?party|upstream|downstream/i.test(body)) score -= 15;
+  if (body.length < 100) score -= 10;
+
+  return Math.max(0, Math.min(100, score));
+}
+
+function estimateScope(issue) {
+  const body = (issue.body || '').toLowerCase();
+  const title = (issue.title || '').toLowerCase();
+  const text = `${title} ${body}`;
+  if (/single\s+file|typo|one.?liner|minor|small|quick/i.test(text)) return 'S';
+  if (/multiple\s+file|refactor|module|component|service/i.test(text)) return 'L';
+  if (/across\s+the\s+fleet|multi.?repo|migration|architecture/i.test(text)) return 'XL';
+  return 'M';
+}
+
+function suggestLabels(issue, classification) {
+  const suggested = [classification];
+  const body = (issue.body || '').toLowerCase();
+  if (/security|auth|secret|token/i.test(body)) suggested.push('security');
+  if (/breaking|migration/i.test(body)) suggested.push('breaking-change');
+  if (/fleet|swarm|multi.?host/i.test(body)) suggested.push('fleet');
+  if (/agent|automation|ci\/?cd/i.test(body)) suggested.push('automation');
+  return [...new Set(suggested)];
+}
+
+function branchName(issueNumber, title) {
+  const slug = (title || 'fix')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return `issue-${issueNumber}-${slug}`;
+}
+
+function formatTriageOutput(issue, repo, dryRun) {
+  const classification = classifyIssue(issue);
+  const confidence = estimateConfidence(issue);
+  const scope = estimateScope(issue);
+  const labels = suggestLabels(issue, classification);
+  const branch = branchName(issue.number, issue.title);
+  const threshold = 95;
+  const action = confidence >= threshold ? 'implement' : 'triage-only';
+
+  const lines = [];
+  lines.push(`issue #${issue.number} | ${classification} | confidence ${confidence} | scope ${scope} | labels: ${labels.join(', ')}`);
+  lines.push(`action: ${action}${confidence < threshold ? ` (below threshold ${threshold})` : ''}`);
+  lines.push(`branch: ${branch}`);
+  if (dryRun) lines.push('dry-run: no mutations performed');
+  lines.push(`repo: ${repo}`);
+
+  if (confidence >= threshold) {
+    lines.push('');
+    lines.push(`implementation plan:`);
+    lines.push(`  1. branch: ${branch}`);
+    lines.push(`  2. implement fix for: ${truncate(issue.title, 80)}`);
+    lines.push(`  3. open PR targeting default branch`);
+    lines.push(`  4. stop — captain reviews and merges`);
+  } else {
+    lines.push('');
+    lines.push(`blockers for implementation:`);
+    if (confidence < 50) lines.push('  - very low confidence — requirements likely ambiguous');
+    else if (confidence < 70) lines.push('  - low confidence — some ambiguity or complexity');
+    else lines.push('  - near threshold — minor clarification may unlock implementation');
+  }
+
+  return lines.join('\n');
+}
+
+function formatTriageComment(issue) {
+  const classification = classifyIssue(issue);
+  const confidence = estimateConfidence(issue);
+  const scope = estimateScope(issue);
+  const labels = suggestLabels(issue, classification);
+  const threshold = 95;
+
+  const lines = [];
+  lines.push(`**Triage** (automated via \`issue-work\`)`);
+  lines.push('');
+  lines.push(`| Field | Value |`);
+  lines.push(`|---|---|`);
+  lines.push(`| Classification | ${classification} |`);
+  lines.push(`| Confidence | ${confidence}/100 |`);
+  lines.push(`| Scope | ${scope} |`);
+  lines.push(`| Suggested labels | ${labels.map((l) => '`' + l + '`').join(', ')} |`);
+  lines.push(`| Action | ${confidence >= threshold ? 'implement + PR' : 'triage only (below ' + threshold + ' threshold)'} |`);
+  lines.push('');
+  if (confidence < threshold) {
+    lines.push(`Confidence is below the ${threshold}% implementation threshold. The issue needs more detail or clarification before automated implementation can proceed.`);
+  }
+
+  return lines.join('\n');
+}
+
+function cmdTriage(args) {
+  const flags = parseFlags(args, {
+    bools: ['dry-run'],
+    values: ['repo', 'confidence-threshold'],
+  });
+  if (flags.help) { process.stdout.write(COMMAND_HELP.triage + '\n'); return; }
+  const number = flags._[0];
+  if (!number) usageError('triage requires an issue number', ['issue-work triage <number>']);
+  const repo = flags.repo || resolveRepo(flags);
+  if (!repo) fail('no repo specified and could not detect from git remote', 'NO_REPO', ['Pass -R/--repo owner/name']);
+
+  const ghArgs = ['issue', 'view', String(number), '--repo', repo, '--json', 'number,title,body,labels,state,author,createdAt'];
+  const issue = ghJson(ghArgs);
+
+  const dryRun = flags.dryRun || false;
+  const output = formatTriageOutput(issue, repo, dryRun);
+  process.stdout.write(output + '\n');
+
+  if (!dryRun && issue.state === 'OPEN') {
+    const commentBody = formatTriageComment(issue);
+    const commentArgs = ['issue', 'comment', String(number), '--repo', repo, '--body', commentBody];
+    ghMutate(commentArgs);
+  }
+}
+
+function cmdList(args) {
+  const flags = parseFlags(args, {
+    bools: ['dry-run', 'untriaged'],
+    values: ['repo', 'label', 'assignee', 'state', 'limit'],
+  });
+  if (flags.help) { process.stdout.write(COMMAND_HELP.list + '\n'); return; }
+
+  const repo = flags.repo || resolveRepo(flags);
+  if (!repo) fail('no repo specified and could not detect from git remote', 'NO_REPO', ['Pass -R/--repo owner/name']);
+
+  const ghArgs = ['issue', 'list', '--repo', repo, '--json', 'number,title,labels,author,createdAt,state'];
+  if (flags.label) ghArgs.push('--label', flags.label);
+  if (flags.assignee) ghArgs.push('--assignee', flags.assignee);
+  if (flags.state) ghArgs.push('--state', flags.state);
+  if (flags.limit) ghArgs.push('--limit', flags.limit);
+  else ghArgs.push('--limit', '30');
+
+  const issues = ghJson(ghArgs);
+  if (!Array.isArray(issues)) fail('unexpected gh-axi output', 'PARSE_ERROR');
+
+  let filtered = issues;
+  if (flags.untriaged) {
+    filtered = issues.filter((i) => {
+      const lbls = (i.labels || []).map((l) => (typeof l === 'string' ? l : l.name || ''));
+      return lbls.length === 0;
+    });
+  }
+
+  const rows = filtered.map((i) => ({
+    number: i.number,
+    title: truncate(i.title, 60),
+    classification: classifyIssue(i),
+    confidence: estimateConfidence(i),
+    scope: estimateScope(i),
+    state: i.state || 'OPEN',
+  }));
+
+  const output = list('issues', ['number', 'title', 'classification', 'confidence', 'scope', 'state'], rows, { total: issues.length });
+  process.stdout.write(output + '\n');
+}
+
+function cmdComment(args) {
+  const flags = parseFlags(args, {
+    bools: [],
+    values: ['repo', 'body'],
+  });
+  if (flags.help) { process.stdout.write(COMMAND_HELP.comment + '\n'); return; }
+  const number = flags._[0];
+  if (!number) usageError('comment requires an issue number', ['issue-work comment <number> --body "text"']);
+  if (!flags.body) usageError('--body is required', ['issue-work comment <number> --body "text"']);
+
+  const repo = flags.repo || resolveRepo(flags);
+  if (!repo) fail('no repo specified and could not detect from git remote', 'NO_REPO', ['Pass -R/--repo owner/name']);
+
+  ghMutate(['issue', 'comment', String(number), '--repo', repo, '--body', flags.body]);
+  process.stdout.write(`comment posted on #${number} (${repo})\n`);
+}
+
+function cmdMain(args) {
+  const flags = parseFlags(args, {
+    bools: ['dry-run'],
+    values: ['repo', 'confidence-threshold'],
+  });
+  if (flags.help) { process.stdout.write(TOP_HELP + '\n'); return; }
+
+  const number = flags._[0];
+  if (!number) {
+    process.stdout.write(TOP_HELP + '\n');
+    return;
+  }
+
+  const repo = flags.repo || resolveRepo(flags);
+  if (!repo) fail('no repo specified and could not detect from git remote', 'NO_REPO', ['Pass -R/--repo owner/name']);
+
+  const threshold = parseInt(flags['confidence-threshold'] || '95', 10);
+
+  const ghArgs = ['issue', 'view', String(number), '--repo', repo, '--json', 'number,title,body,labels,state,author,createdAt'];
+  const issue = ghJson(ghArgs);
+
+  if (issue.state !== 'OPEN') {
+    process.stdout.write(`issue #${number} is ${issue.state} — no action\n`);
+    return;
+  }
+
+  const dryRun = flags.dryRun || false;
+  const confidence = estimateConfidence(issue);
+  const classification = classifyIssue(issue);
+  const scope = estimateScope(issue);
+  const labels = suggestLabels(issue, classification);
+  const branch = branchName(issue.number, issue.title);
+
+  const triageOutput = formatTriageOutput(issue, repo, dryRun);
+  process.stdout.write(triageOutput + '\n');
+
+  if (!dryRun) {
+    const commentBody = formatTriageComment(issue);
+    const commentArgs = ['issue', 'comment', String(number), '--repo', repo, '--body', commentBody];
+    ghMutate(commentArgs);
+  }
+
+  if (confidence < threshold) {
+    process.stdout.write(`\nconfidence ${confidence} < threshold ${threshold} — stopping at triage\n`);
+    return;
+  }
+
+  if (dryRun) {
+    process.stdout.write(`\ndry-run: would implement on branch ${branch}\n`);
+    return;
+  }
+
+  process.stdout.write(`\nconfidence ${confidence} >= threshold ${threshold} — ready to implement\n`);
+  process.stdout.write(`branch: ${branch}\n`);
+  process.stdout.write(`next: implement fix and open PR\n`);
+  process.stdout.write(`\nissue-automation skill: the calling agent should now implement the fix\n`);
+  process.stdout.write(`  1. git checkout -b ${branch}\n`);
+  process.stdout.write(`  2. implement the fix described in #${number}\n`);
+  process.stdout.write(`  3. open a PR — captain reviews and merges\n`);
+}
+
+const args = process.argv.slice(2);
+
+if (args.includes('-v') || args.includes('-V') || args.includes('--version')) {
+  process.stdout.write(`issue-work ${VERSION}\n`);
+  process.exit(0);
+}
+
+const sub = args[0];
+const rest = args.slice(1);
+
+switch (sub) {
+  case 'triage':
+    cmdTriage(rest);
+    break;
+  case 'list':
+    cmdList(rest);
+    break;
+  case 'comment':
+    cmdComment(rest);
+    break;
+  default:
+    cmdMain(args);
+    break;
+}
